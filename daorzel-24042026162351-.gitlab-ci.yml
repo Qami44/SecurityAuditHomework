@@ -1,0 +1,120 @@
+#Global variables
+variables:
+  PROJECT_NAME: "securityaudit"
+  DOCKER_BUILD_IMAGE: $CI_REGISTRY_IMAGE:$CI_PIPELINE_ID
+  DOCKER_BUILD_DESTINATION: $DOCKERHUB_USERNAME/$DOCKER_BUILD_IMAGE
+
+#List of stages
+stages:
+  - code_test
+  - build
+  - scan
+  - push
+  - deploy
+
+#Template for gitlab login
+.gitlab-docker-login:
+  script:
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+
+#lint job config
+docker-lint:
+  variables:
+    DOCKERFILE: "Dockerfile"
+  stage: code_test
+  image: pipelinecomponents/hadolint:latest
+  script:
+    - hadolint $DOCKERFILE
+
+# # #SAST job stage config,
+semgrep-sast:
+  image: semgrep/semgrep
+  stage: code_test
+  script:
+    - semgrep ci --config=auto --gitlab-sast > gl-sast-report.json
+    - cat gl-sast-report.json # Display the content of the report for debugging purposes
+  artifacts:
+    when: always
+    paths:
+      - gl-sast-report.json
+
+#Build job config
+build:
+  stage: build
+  image: docker:28.1
+  services:
+    - docker:dind
+  script:
+    - docker build -t securityaudit .
+    - docker tag securityaudit $DOCKER_BUILD_IMAGE
+    - !reference [.gitlab-docker-login, script]
+    - docker push $DOCKER_BUILD_IMAGE
+  needs:
+    - docker-lint
+    - semgrep-sast
+
+#Container scanning job config
+container_scanning:
+  stage: scan
+  image:
+    name: docker.io/aquasec/trivy:latest
+    entrypoint: [""]
+  variables:
+    GIT_STRATEGY: none
+    TRIVY_USERNAME: "$CI_REGISTRY_USER"
+    TRIVY_PASSWORD: "$CI_REGISTRY_PASSWORD"
+    TRIVY_AUTH_URL: "$CI_REGISTRY"
+    FULL_IMAGE_NAME: $DOCKER_BUILD_IMAGE
+  script:
+    - trivy --version
+    - rm -rf .trivycache/
+    - mkdir -p .trivycache/
+    - time trivy --cache-dir .trivycache/ image --download-db-only --no-progress
+    - trivy image --exit-code 0 --cache-dir .trivycache/ --no-progress --format template --template "@/contrib/gitlab.tpl"
+        --output "$CI_PROJECT_DIR/gl-container-scanning-report.json" "$FULL_IMAGE_NAME"
+    - trivy image --exit-code 0 --cache-dir .trivycache/ --no-progress "$FULL_IMAGE_NAME"
+    - trivy image --exit-code 1 --cache-dir .trivycache/ --severity CRITICAL --no-progress "$FULL_IMAGE_NAME"
+  cache:
+    paths:
+      - .trivycache/
+  # Enables https://docs.gitlab.com/ee/user/application_security/container_scanning/ (Container Scanning report is available on GitLab EE Ultimate or GitLab.com Gold)
+  artifacts:
+    when: always
+    reports:
+      container_scanning: gl-container-scanning-report.json
+  needs:
+    - build
+      
+#Push job config
+push:
+  stage: push
+  image: docker:23.0
+  services:
+    - docker:dind
+  variables:
+    DOCKER_IMAGE_DESTINATION: $ECR_REPOSITORY:$CI_PIPELINE_ID
+  before_script:
+    - |
+      apk add --no-cache \
+              python3 \
+              py3-pip \
+            && pip3 install --upgrade pip \
+            && pip3 install --no-cache-dir \
+                awscli
+  script:
+    - docker pull $DOCKER_BUILD_DESTINATION
+    - docker tag $DOCKER_BUILD_DESTINATION $DOCKER_IMAGE_DESTINATION
+    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_ID
+    - docker push $DOCKER_IMAGE_DESTINATION
+  needs: 
+    - container_scanning
+
+
+# Deploy job config
+deploy:
+  stage: deploy
+  image: fabfuel/ecs-deploy:1.14.1
+  script:
+     - ecs deploy $ECS_CLUSTER_NAME $ECS_SERVICE_NAME --image $CONTAINER_NAME $ECR_REPOSITORY:$CI_PIPELINE_ID --timeout=1200 --rollback
+  needs: 
+    - push
